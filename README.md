@@ -1,14 +1,11 @@
 # HTTP request idempotency on the Critter Stack
 
-A working extraction of how we do `Idempotency-Key` on Wolverine HTTP + Marten, pulled out of a payments API into
-a runnable sample so it can be reviewed.
+`Idempotency-Key` on Wolverine HTTP + Marten, extracted from a production payments API into a runnable sample.
 
-It is here for feedback. The mechanism is in production, the tests pass, and there are still four or five places
-where we reasoned our way to an answer instead of finding one — those are listed at the bottom under
-[Open questions](#open-questions). If the answer to any of them is "there's a supported hook for that", the code
-should get smaller.
+It is here for review. The [open questions](#open-questions) are places where we worked around something instead of
+finding a supported hook for it. Each one is reproduced in the repo.
 
-## What we're after
+## The contract
 
 Every POST accepts a client-generated `Idempotency-Key` header:
 
@@ -20,45 +17,54 @@ Every POST accepts a client-generated `Idempotency-Key` header:
 | Same key, different request body | `422` |
 | Same key, first request failed | Key is free again; the corrected retry works |
 
-And underneath all of it: **the idempotency record and the work it guards commit together, or neither does.**
+The idempotency record and the work it guards commit together or neither does. The record is a Marten document
+written through the caller's own `IDocumentSession`, so there is one commit. Only 2xx responses are stored.
 
-That last line is the whole design. Put the record anywhere else — a cache, a second store, a second transaction —
-and the order is forced: reserve the key, run the work, write the response last, because the response does not
-exist any earlier. A process that dies between the commit and that last write leaves the work done with the key
-still marked in flight. The next retry past the hold expiry does the work a second time.
+## Open questions
 
-The record lives in the same Postgres, written through the caller's own `IDocumentSession`. There is one commit.
+**1. Is `Response.OnStarting` the right place to release a key?**
+A Wolverine `Finally` cannot be paired with a `Before` that returns `IResult`. Add
+`public Task Finally(HttpContext httpContext)` to `IdempotencyMiddleware` and code generation dies:
 
-## Why byte-for-byte, and not key-as-identity
+```
+System.NullReferenceException: Object reference not set to an instance of an object.
+   at Wolverine.Http.CodeGen.MaybeEndWithResultFrame.GenerateCode(GeneratedMethod method, ISourceWriter writer)
+      in src/Http/Wolverine.Http/CodeGen/ResultContinuationPolicy.cs:69
+```
 
-The first reaction this design gets is a good one: *why not make the client's key the identity of the command,
-operation, or event stream, let the domain enforce once-only, and answer a retry with the current state of the
-resource?* No response storage, no serialization, no fight with the transaction boundary.
+Is the pairing meant to work, and is there a supported unwinding hook for a short-circuiting `Before`?
 
-**For a POST that starts a stream, that is the better answer, and we would use it.** `POST /orders` with the key as
-the stream id needs none of this machinery.
+**2. Should `[WriteAggregate]` make a chain `IsTransactional`?**
+`chain.IsTransactional` is false for a chain whose only Marten shape is `[WriteAggregate]`, and that chain does get
+a commit frame. Drop the `IDocumentSession` parameter from `Approve`, comment out the policy, and
+`dotnet run --project src/Api -- codegen write` emits:
 
-It stops generalizing in three places, and we needed something that covered every POST rather than the ones that
-happen to fit:
+```csharp
+(var committedAggregateOfOrder, var orderApproved) = OrderEndpoints.Approve(stream_order.Aggregate);
+var order_response = await CommittedAggregate<Order>.Project(stream_order, documentSession, ...);
+await documentSession.SaveChangesAsync(httpContext.RequestAborted);   // <- the frame IsTransactional says isn't there
+```
 
-1. **Requests that resolve to a set or a range have no identity to be.** One of ours replays webhook deliveries and
-   names either a list of event ids or a time window. There is no entity whose id the key could be. A second
-   mechanism for the second body shape is two mechanisms to keep in step.
-2. **Most POSTs mutate an aggregate that already exists.** Approve, cancel, expire, confirm. The stream id is
-   already taken by the resource; the key cannot be it.
-3. **Current state is a different answer than the one the first caller got.** If a concurrent writer moved the
-   aggregate on, replaying "current state" hands the retrying caller something the original request never produced,
-   under the same status code. Byte-for-byte plus an explicit `Idempotent-Replayed` header makes the weaker claim
-   honestly: *this is the result you already have*, not *the work happened again*.
+So `Approve` carries an unused `IDocumentSession` purely to pass our own guard. Is there a supported way for a
+policy to ask whether a chain will get a commit frame?
 
-Only 2xx responses are stored. A `404`, a validation failure, or a refused arm of a `Results<…>` union describes
-the request that was sent, not work that happened — so the key is released and the caller can fix the body and
-retry under the same key.
+**3. Is `UseForResponse` + `MiddlewarePolicy` frame ordering meant to be managed by hand?**
+Both append to `chain.Postprocessors` rather than positioning within it, so the `CommittedAggregate<T>` projection
+frame lands behind the commit on the first pass, and behind the `After` middleware that reads its result on the
+second. We re-hoist it to index 0 after every appending pass (`CommittedAggregate.HoistProjection`). Is there a
+supported way to position a frame relative to the commit frame?
 
-## The shape
+**4. Can the aggregate Wolverine re-fetches for an `UpdatedAggregate` response be observed?**
+We assume not, and wrote `CommittedAggregate<T>` instead. Is projecting pending, uncommitted events ahead of the
+save a sound thing to be doing?
 
-Everything is frames in the endpoint's own generated chain. There is no ASP.NET middleware, no request-scoped
-bridging service, and no second mechanism to keep in step with the first.
+**5. Reading the raw body from a chain frame.**
+`EnableBuffering` plus a rewind works, but the ordering it depends on comes from registration order, in reverse, and
+nothing checks it. Is there a supported way to say "this frame runs before body deserialization"?
+
+## How it works
+
+Frames in the endpoint's own generated chain. No ASP.NET middleware, no request-scoped bridging service.
 
 ```
 IdempotencyPolicy                 IHttpPolicy. Walks every POST chain at code-generation time, refuses the
@@ -85,34 +91,25 @@ Response.OnStarting               Releases the key for any request that did not 
 | `IdempotencyRecord.cs` | The Marten document |
 | `IdempotencyScope.cs` | Composes principal + route + supplied key into the document id |
 
-Three things are worth calling out because they are not obvious from the code:
+**The policy has to be the last registration.** The fingerprint reads the request body before anything deserializes
+it, and a Wolverine middleware frame is inserted at the *head* of a chain. Getting it wrong does not fail: the hash
+is taken over a drained stream, every request digests zero bytes, and every fingerprint matches. So `Fingerprint`
+throws if it reads nothing from a request that declared a body.
 
-**The policy runs before the frames it competes with exist.** The fingerprint has to read the request body before
-anything deserializes it, and a Wolverine middleware frame is inserted at the *head* of a chain — so
-`AddPolicy<IdempotencyPolicy>()` has to be the **last** registration. Nothing enforces that, and getting it wrong
-does not fail: the hash is taken over an already-drained stream, every request digests zero bytes, and every
-fingerprint comparison passes. So `Fingerprint` throws if it reads nothing from a request that declared a body.
-
-**A reservation and a completion use different sessions on purpose.** The reservation commits on its own session,
-because a concurrent duplicate has to be able to see it. The completion enrolls in the caller's session, because
-that is what makes it all-or-nothing with the work.
+**A reservation and a completion use different sessions.** The reservation commits on its own session, because a
+concurrent duplicate has to see it. The completion enrolls in the caller's session, because that is what makes it
+all-or-nothing with the work.
 
 **Every write after the reservation is conditioned on an ownership token.** A request that stalls past
-`ReservationTimeout` loses its key to a later request. Deleting by id alone would let the stalled request remove
-its successor's record. Conditioned on the token, the delete matches nothing, the insert behind it collides, and
-the stalled request's whole transaction rolls back — taking its work with it, which is the correct outcome.
+`ReservationTimeout` loses its key to a later request. Conditioned on the token, the stalled request's delete
+matches nothing, its insert collides, and its whole transaction rolls back — taking its work with it.
 
-## The aggregate problem, and `CommittedAggregate<T>`
-
-This is the part that sent us to Discord.
+### `CommittedAggregate<T>`
 
 An endpoint returning `UpdatedAggregate` hands Wolverine a marker, and Wolverine writes the response by re-fetching
-the aggregate **after** the transaction commits. The idempotency completion rides that same transaction, so it runs
-*before* the body exists. There is nothing to store. Storing the aggregate that is already in scope instead gets its
-state as loaded at the start of the request, which would replay a stale body as though it were the real response.
-
-`CommittedAggregate<T>` is an `IResponseAware` marker that projects the aggregate from the events the session has
-**already queued but not yet committed**, using `session.Events.ProjectLatest<T>()`:
+the aggregate *after* the transaction commits. The completion rides that same transaction, so it runs before the
+body exists. `CommittedAggregate<T>` is an `IResponseAware` marker that projects the aggregate from the events the
+session has queued but not yet committed, via `session.Events.ProjectLatest<T>()`:
 
 ```csharp
 [WolverinePost("/orders/{orderId}/approve")]
@@ -121,80 +118,29 @@ public static (CommittedAggregate<Order>, OrderApproved) Approve([WriteAggregate
     (new CommittedAggregate<Order>(), new OrderApproved());
 ```
 
-The body now exists before the commit, so the completion record can store it. It is also the stronger answer on its
-own terms: the projection sees exactly this transaction's events, where a post-commit re-read would absorb a
-concurrent writer's.
+Marten stamps an event's `Timestamp` and `UserName` as it saves, so a projection running ahead of the commit reads
+events carrying neither. `CommittedAggregate<T>` stamps the pending events with the values Marten would have
+written; Marten leaves already-set values alone, so the response and the committed document agree.
 
-One trap comes with it. Marten stamps an event's `Timestamp` and `UserName` **as it saves**, so a projection running
-ahead of the commit reads events carrying neither, and an aggregate that derives audit metadata from its last event
-answers with the year 1. `CommittedAggregate<T>` stamps the pending events with the values Marten would have
-written; Marten leaves already-set values alone, so the answer and the committed document agree. There is a test for
-exactly this.
+### Build-time guards
 
-## Build-time guards
-
-Two things fail code generation rather than degrade quietly:
+Two shapes fail code generation rather than degrade quietly:
 
 - **A POST that cannot commit a Marten transaction.** Its completion record would insert into a session nothing
-  flushes — a key that reads as reserved forever and a replay that never comes. An endpoint that genuinely cannot
-  hold a transaction marks itself `[IdempotencyOptOut]` (see `/widgets/preview`).
-- **A POST whose response its chain never puts in scope.** This is exactly the `UpdatedAggregate` shape above, and
-  the error message names `CommittedAggregate<T>` as the fix.
+  flushes. An endpoint that genuinely cannot hold a transaction marks itself `[IdempotencyOptOut]`.
+- **A POST whose response its chain never puts in scope** — the `UpdatedAggregate` shape above. The error names
+  `CommittedAggregate<T>` as the fix.
 
-The alternative is a runtime tier of endpoints where the header is silently inert — a guarantee that holds
-everywhere except where nobody checked.
+## Why stored responses, and not key-as-identity
 
-## Open questions
+Making the client's key the identity of the command or event stream needs none of this machinery, and for a POST
+that starts a stream it is the better answer. It does not generalize:
 
-These are the reason the repo exists. Each is something we observed and worked around; if there is a supported hook
-we missed, we would rather use it.
-
-**1. Is `Response.OnStarting` the right place to release a key?**
-A Wolverine `Finally` cannot be paired with a `Before` that returns `IResult`. Add
-`public Task Finally(HttpContext httpContext)` to `IdempotencyMiddleware` and code generation dies:
-
-```
-System.NullReferenceException: Object reference not set to an instance of an object.
-   at Wolverine.Http.CodeGen.MaybeEndWithResultFrame.GenerateCode(GeneratedMethod method, ISourceWriter writer)
-      in src/Http/Wolverine.Http/CodeGen/ResultContinuationPolicy.cs:69
-```
-
-`Response.OnStarting` is what we fell back to, and it happens to be *better* — a key released as the response
-starts survives an instant retry, where one released as the pipeline unwinds races it. But we did not choose it, we
-were left with it. Is the pairing meant to work, and is there a supported unwinding hook for a short-circuiting
-`Before`?
-
-**2. Should `[WriteAggregate]` make a chain `IsTransactional`?**
-`chain.IsTransactional` is decided during Wolverine's own transaction-detection pass, which completes chain by
-chain *before* any `IHttpPolicy` runs — so the middleware's own `IDocumentSession` parameter never counts toward
-it. Fine. But it is also **false** for a chain whose only Marten shape is `[WriteAggregate]`, and that chain
-*does* get a commit frame. Drop the `IDocumentSession` parameter from `Approve`, comment out the policy, and
-`dotnet run --project src/Api -- codegen write` emits this:
-
-```csharp
-(var committedAggregateOfOrder, var orderApproved) = OrderEndpoints.Approve(stream_order.Aggregate);
-var order_response = await CommittedAggregate<Order>.Project(stream_order, documentSession, ...);
-await documentSession.SaveChangesAsync(httpContext.RequestAborted);   // <- the frame IsTransactional says isn't there
-```
-
-So `Approve` carries an unused `IDocumentSession` purely to make our own guard pass. Is there a supported way for a
-policy to ask *"will this chain get a commit frame?"* rather than inferring it from `IsTransactional`?
-
-**3. Is `UseForResponse` + `MiddlewarePolicy` frame ordering meant to be managed by hand?**
-Both **append** to `chain.Postprocessors` rather than positioning within it. So the `CommittedAggregate<T>`
-projection frame lands behind the commit on the first pass, and behind the `After` middleware that reads its result
-on the second. We re-hoist it to index 0 after every pass that appends (`CommittedAggregate.HoistProjection`). Is
-there a supported way to position a frame relative to the commit frame?
-
-**4. Is there any way to observe the aggregate Wolverine re-fetches for an `UpdatedAggregate` response?**
-We assume no — a hook that runs after the response is written but still inside the handler's transaction is close
-to self-contradictory. `CommittedAggregate<T>` is our answer. We would like to know whether projecting pending
-events ahead of the save is a sound thing to be doing, or whether it has edges we have not hit.
-
-**5. Reading the raw body from a chain frame.**
-It works, and `EnableBuffering` + rewind is doing the job. But the ordering it depends on is set by registration
-order, in reverse, and nothing checks it — which is why `Fingerprint` throws on a drained stream. Is there a
-supported way to say "this frame runs before body deserialization"?
+1. A request that resolves to a set or a range has no identity to be. A webhook replay naming a list of event ids
+   or a time window has no entity whose id the key could be.
+2. Most POSTs mutate an aggregate that already exists. The stream id is taken by the resource.
+3. Current state is a different answer than the one the first caller got. If a concurrent writer moved the aggregate
+   on, replaying current state under the original status code returns something the first request never produced.
 
 ## Running it
 
@@ -204,11 +150,9 @@ dotnet test                   # 50 tests
 dotnet run --project src/Api  # the sample API on http://localhost:5000
 ```
 
-The tests are the documentation. `tests/Api.Tests/IdempotencyEndpointTests.cs` walks the whole contract over real
-HTTP with Alba.
+`tests/Api.Tests/IdempotencyEndpointTests.cs` walks the whole contract over real HTTP with Alba.
 
 ```sh
-# Create a widget twice under one key
 curl -i -X POST http://localhost:5000/widgets \
   -H 'Content-Type: application/json' \
   -H 'X-Tenant: tenant-a' \
@@ -216,60 +160,47 @@ curl -i -X POST http://localhost:5000/widgets \
   -d '{"name":"first","size":3}'
 ```
 
-Run it twice. The second response carries the same body, the same `Location`, and `Idempotent-Replayed: true`:
+Run it twice:
 
 ```
-HTTP/1.1 201 Created                        HTTP/1.1 201 Created
+HTTP/1.1 201 Created                            HTTP/1.1 201 Created
 Content-Type: application/json; charset=utf-8   Content-Type: application/json
-Location: /widgets/019fd5c3-…                Location: /widgets/019fd5c3-…
-                                             Idempotent-Replayed: true
+Location: /widgets/019fd5c3-…                   Location: /widgets/019fd5c3-…
+                                                Idempotent-Replayed: true
 
-{"id":"019fd5c3-…","name":"first",…}         {"id":"019fd5c3-…","name":"first",…}
+{"id":"019fd5c3-…","name":"first",…}            {"id":"019fd5c3-…","name":"first",…}
 ```
-
-Note the `charset` parameter. The description is built from the result object *before* the response is written, so
-it records the media type the handler implies rather than the one ASP.NET's writer eventually emits. The body is
-byte-identical; `Content-Type` is equivalent rather than identical. A client that parses the header is unaffected;
-one that string-compares it is not.
 
 ### The sample endpoints
 
-Each one exists to exercise a distinct arm of the mechanism.
-
 | Endpoint | What it demonstrates |
 | --- | --- |
-| `POST /widgets` | Reserve → store → byte-for-byte replay. Its refusing arm frees the key for a corrected retry |
-| `POST /orders/{id}/approve` | `CommittedAggregate<T>`: an aggregate response stored inside its own transaction. Also `[IdempotencyRequired]` |
+| `POST /widgets` | Reserve → store → replay. Its refusing arm frees the key for a corrected retry |
+| `POST /orders/{id}/approve` | `CommittedAggregate<T>`, and `[IdempotencyRequired]` |
 | `POST /widgets/{id}/archive` | A `204`: why completion is a timestamp and not "the body is null" |
 | `POST /widgets/{id}/tokens` | `[IdempotencyOmitsResponseBody]` — a one-time secret replays status and `Location` alone |
-| `POST /widgets/preview` | `[IdempotencyOptOut]` — no transaction, so no guarantee, and it says so |
+| `POST /widgets/preview` | `[IdempotencyOptOut]` — no transaction, so no guarantee |
 
-### Sample scaffolding, not part of the mechanism
-
-`TenantAuthenticationHandler` reads an `X-Tenant` header and calls it a principal. It stands in for real
-authentication because the key is scoped to the caller: two tenants sending the same key must not reach each
-other's stored response, and there is a test for that. Do not copy it.
+`TenantAuthenticationHandler` stands in for real authentication, because the key is scoped to the caller. Two
+tenants sending the same key must not reach each other's stored response. Do not copy it.
 
 ## Known trade-offs
 
-- **A key is held for a bounded time, and a request that outlives its hold loses it.** `ReservationTimeout` has to
-  exceed the worst-case duration of every endpoint that can reserve a key. Set below it, a slow but healthy request
-  loses its reservation mid-flight and its own completion rolls the work back. The metric to watch is `takeover`.
-- **Work that rolls back leaves its key held** until the reservation expires. The completion is queued before the
-  save, so a save that fails for an unrelated reason rolls the record back while the reservation reads as complete
-  in memory. It self-heals on the same timer a process crash does.
+- **A request that outlives its hold loses its key.** `ReservationTimeout` has to exceed the worst-case duration of
+  every endpoint that can reserve one. Set it too low and a slow but healthy request loses its reservation
+  mid-flight, and its own completion rolls the work back. The metric to watch is `takeover`.
+- **Work that rolls back leaves its key held** until the reservation expires. It self-heals on the same timer a
+  process crash does.
 - **A handler that calls `SaveChangesAsync` itself gets a weaker guarantee.** The build-time check proves the
-  framework will append a commit frame; it cannot see that the handler already committed. Those endpoints get work
-  in one transaction and the record in another — the exact split this design exists to close — and no check will
-  say so.
-- **A request that never starts a response leaves its key held.** The release runs as the response starts, so an
-  abandoned connection keeps its key until the hold expires.
+  framework will append a commit frame; it cannot see that the handler already committed. Those endpoints get the
+  work in one transaction and the record in another, and no check will say so.
+- **A request that never starts a response leaves its key held.** The release runs as the response starts.
 - **A multipart body is not fingerprinted.** Its boundary is randomly generated, so the same logical upload sent
-  twice is different bytes and hashing would refuse the retry as a different request. The key alone identifies
-  those requests. (The sample has no upload endpoint; the production one does.)
-- **A replayed `Content-Type` is equivalent, not identical.** See the `charset` note above.
-- **`PurgeExpiredIdempotencyRecords` is housekeeping, not correctness.** Expiry is read when a key is looked up, so
-  a purge that never runs costs space alone. Wire it to whatever scheduler the host already has.
+  twice is different bytes. The key alone identifies those requests.
+- **A replayed `Content-Type` is equivalent, not identical.** It drops the `charset` parameter, because the
+  description is built from the result object before the writer emits the header. The body is byte-identical.
+- **`PurgeExpiredIdempotencyRecords` is housekeeping, not correctness.** Expiry is read at lookup, so a purge that
+  never runs costs space alone.
 
 ## License
 
