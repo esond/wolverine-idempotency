@@ -15,7 +15,7 @@ Every POST accepts a client-generated `Idempotency-Key` header:
 | Situation | Response |
 | --- | --- |
 | New key | Reserve it, run the work, store the response |
-| Same key, first request finished | Replay that response byte for byte, with `Idempotent-Replayed: true` |
+| Same key, first request finished | Replay that response body byte for byte, with `Idempotent-Replayed: true` |
 | Same key, first request still in flight | `409` |
 | Same key, different request body | `422` |
 | Same key, first request failed | Key is free again; the corrected retry works |
@@ -150,19 +150,35 @@ These are the reason the repo exists. Each is something we observed and worked a
 we missed, we would rather use it.
 
 **1. Is `Response.OnStarting` the right place to release a key?**
-A Wolverine `Finally` cannot be paired with a `Before` that returns `IResult` — the frame wrapping the two never
-resolves the continuation's `HttpContext`, and code generation fails. `Response.OnStarting` is what we fell back
-to, and it happens to be *better* (a key released as the response starts survives an instant retry, where one
-released as the pipeline unwinds races it). But we did not choose it, we were left with it. Is there a supported
-unwinding hook that pairs with a short-circuiting `Before`?
+A Wolverine `Finally` cannot be paired with a `Before` that returns `IResult`. Add
+`public Task Finally(HttpContext httpContext)` to `IdempotencyMiddleware` and code generation dies:
+
+```
+System.NullReferenceException: Object reference not set to an instance of an object.
+   at Wolverine.Http.CodeGen.MaybeEndWithResultFrame.GenerateCode(GeneratedMethod method, ISourceWriter writer)
+      in src/Http/Wolverine.Http/CodeGen/ResultContinuationPolicy.cs:69
+```
+
+`Response.OnStarting` is what we fell back to, and it happens to be *better* — a key released as the response
+starts survives an instant retry, where one released as the pipeline unwinds races it. But we did not choose it, we
+were left with it. Is the pairing meant to work, and is there a supported unwinding hook for a short-circuiting
+`Before`?
 
 **2. Should `[WriteAggregate]` make a chain `IsTransactional`?**
 `chain.IsTransactional` is decided during Wolverine's own transaction-detection pass, which completes chain by
 chain *before* any `IHttpPolicy` runs — so the middleware's own `IDocumentSession` parameter never counts toward
-it. Fine. But it is also **false** for a chain whose only Marten shape is `[WriteAggregate]`, even though such a
-chain does get a commit frame. The `Approve` endpoint above carries an unused `IDocumentSession` purely to make the
-guard pass. Is there a supported way for a policy to ask *"will this chain get a commit frame?"* rather than
-inferring it?
+it. Fine. But it is also **false** for a chain whose only Marten shape is `[WriteAggregate]`, and that chain
+*does* get a commit frame. Drop the `IDocumentSession` parameter from `Approve`, comment out the policy, and
+`dotnet run --project src/Api -- codegen write` emits this:
+
+```csharp
+(var committedAggregateOfOrder, var orderApproved) = OrderEndpoints.Approve(stream_order.Aggregate);
+var order_response = await CommittedAggregate<Order>.Project(stream_order, documentSession, ...);
+await documentSession.SaveChangesAsync(httpContext.RequestAborted);   // <- the frame IsTransactional says isn't there
+```
+
+So `Approve` carries an unused `IDocumentSession` purely to make our own guard pass. Is there a supported way for a
+policy to ask *"will this chain get a commit frame?"* rather than inferring it from `IsTransactional`?
 
 **3. Is `UseForResponse` + `MiddlewarePolicy` frame ordering meant to be managed by hand?**
 Both **append** to `chain.Postprocessors` rather than positioning within it. So the `CommittedAggregate<T>`
@@ -184,8 +200,8 @@ supported way to say "this frame runs before body deserialization"?
 
 ```sh
 docker compose up -d          # Postgres on 5433
-dotnet test                   # 39 tests
-dotnet run --project src/Api  # the sample API
+dotnet test                   # 50 tests
+dotnet run --project src/Api  # the sample API on http://localhost:5000
 ```
 
 The tests are the documentation. `tests/Api.Tests/IdempotencyEndpointTests.cs` walks the whole contract over real
@@ -200,7 +216,21 @@ curl -i -X POST http://localhost:5000/widgets \
   -d '{"name":"first","size":3}'
 ```
 
-Run it twice. The second response is byte-identical and carries `Idempotent-Replayed: true`.
+Run it twice. The second response carries the same body, the same `Location`, and `Idempotent-Replayed: true`:
+
+```
+HTTP/1.1 201 Created                        HTTP/1.1 201 Created
+Content-Type: application/json; charset=utf-8   Content-Type: application/json
+Location: /widgets/019fd5c3-…                Location: /widgets/019fd5c3-…
+                                             Idempotent-Replayed: true
+
+{"id":"019fd5c3-…","name":"first",…}         {"id":"019fd5c3-…","name":"first",…}
+```
+
+Note the `charset` parameter. The description is built from the result object *before* the response is written, so
+it records the media type the handler implies rather than the one ASP.NET's writer eventually emits. The body is
+byte-identical; `Content-Type` is equivalent rather than identical. A client that parses the header is unaffected;
+one that string-compares it is not.
 
 ### The sample endpoints
 
@@ -237,6 +267,7 @@ other's stored response, and there is a test for that. Do not copy it.
 - **A multipart body is not fingerprinted.** Its boundary is randomly generated, so the same logical upload sent
   twice is different bytes and hashing would refuse the retry as a different request. The key alone identifies
   those requests. (The sample has no upload endpoint; the production one does.)
+- **A replayed `Content-Type` is equivalent, not identical.** See the `charset` note above.
 - **`PurgeExpiredIdempotencyRecords` is housekeeping, not correctness.** Expiry is read when a key is looked up, so
   a purge that never runs costs space alone. Wire it to whatever scheduler the host already has.
 
