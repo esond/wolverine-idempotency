@@ -1,5 +1,4 @@
 using JasperFx.Events;
-using Marten;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Wolverine.Http;
 using Wolverine.Http.Marten;
@@ -88,14 +87,9 @@ public static class OrderEndpoints
     /// Returning <see cref="Wolverine.Marten.UpdatedAggregate" /> here would write the body by re-reading the
     /// aggregate after the commit — after the frame that stores the idempotency record has already run. There would
     /// be nothing to store.
-    ///
-    /// The session parameter is unused, and load-bearing anyway: <c>chain.IsTransactional</c> is still false at the
-    /// point an <see cref="Wolverine.Http.IHttpPolicy" /> runs for a chain whose only Marten shape is
-    /// <c>[WriteAggregate]</c>, so without it the policy's own guard rejects this endpoint.
     /// </remarks>
     [IdempotencyRequired]
     [WolverinePost("/orders/{orderId}/approve")]
-    public static (CommittedAggregate<Order>, OrderApproved) Approve([WriteAggregate] Order order,
-        IDocumentSession session) =>
+    public static (CommittedAggregate<Order>, OrderApproved) Approve([WriteAggregate] Order order) =>
         (new CommittedAggregate<Order>(), new OrderApproved());
 }

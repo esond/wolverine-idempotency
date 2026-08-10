@@ -1,9 +1,11 @@
+using System.Reflection;
 using JasperFx;
 using JasperFx.CodeGeneration;
 using JasperFx.CodeGeneration.Frames;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Wolverine.Http;
+using Wolverine.Marten;
 using Wolverine.Middleware;
 
 namespace Idempotency;
@@ -22,7 +24,9 @@ namespace Idempotency;
 /// <see cref="IdempotencyMiddleware" />'s own <see cref="Marten.IDocumentSession" /> parameter, so a handler that
 /// doesn't itself trigger the detection gets no save frame at all: the completion record inserts into a session
 /// nothing ever flushes. A chain whose only Marten shape is <c>[WriteAggregate]</c> does get a commit frame while
-/// <c>chain.IsTransactional</c> stays false — a confirmed Wolverine bug, filed as JasperFx/wolverine#3893.
+/// <c>chain.IsTransactional</c> stays false — a confirmed Wolverine bug, filed as JasperFx/wolverine#3893 — so
+/// <see cref="WritesAggregate" /> checks that shape directly rather than making every such handler carry a decoy
+/// <c>IDocumentSession</c> parameter to flip the detection.
 ///
 /// Nothing here can assert the registration order <see cref="IdempotencyMiddleware" /> needs, because a policy runs
 /// before the frames it competes with exist. That check lives at runtime instead.
@@ -56,7 +60,7 @@ public sealed class IdempotencyPolicy : IHttpPolicy
                 continue;
             }
 
-            if (!chain.IsTransactional)
+            if (!chain.IsTransactional && !WritesAggregate(chain))
                 throw new InvalidOperationException(
                     $"POST {chain.OperationId} needs a Marten transaction — its idempotency completion record only " +
                     "persists by riding the handler's own commit. Give the handler an " +
@@ -95,6 +99,17 @@ public sealed class IdempotencyPolicy : IHttpPolicy
             .Single(call => call.Method.DeclaringType == middlewareType && call.Method.Name == CompletionMethod)
             .TrySetArgument(ResponseParameter, response);
     }
+
+    /// <remarks>
+    /// Duplicates the one fragment of Wolverine's transaction detection that the framework's own pass misses
+    /// (JasperFx/wolverine#3893): the aggregate-handler workflow appends a commit frame for a
+    /// <c>[WriteAggregate]</c> parameter, but <c>chain.IsTransactional</c> does not count it. Deliberately this
+    /// narrow — any other transactional shape should flip the flag itself, and a wider re-implementation here
+    /// would drift as the framework adds shapes.
+    /// </remarks>
+    private static bool WritesAggregate(HttpChain chain) =>
+        chain.Method.Method.GetParameters()
+            .Any(parameter => parameter.GetCustomAttribute<WriteAggregateAttribute>() is not null);
 
     private static Type MiddlewareFor(HttpChain chain)
     {

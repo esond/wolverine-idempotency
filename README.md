@@ -36,8 +36,7 @@ Is the pairing meant to work, and is there a supported unwinding hook for a shor
 
 **2. Should `[WriteAggregate]` make a chain `IsTransactional`?**
 `chain.IsTransactional` is false for a chain whose only Marten shape is `[WriteAggregate]`, and that chain does get
-a commit frame. Drop the `IDocumentSession` parameter from `Approve`, comment out the policy, and
-`dotnet run --project src/Api -- codegen write` emits:
+a commit frame. Comment out the policy, and `dotnet run --project src/Api -- codegen write` emits, for `Approve`:
 
 ```csharp
 (var committedAggregateOfOrder, var orderApproved) = OrderEndpoints.Approve(stream_order.Aggregate);
@@ -45,8 +44,9 @@ var order_response = await CommittedAggregate<Order>.Project(stream_order, docum
 await documentSession.SaveChangesAsync(httpContext.RequestAborted);   // <- the frame IsTransactional says isn't there
 ```
 
-So `Approve` carries an unused `IDocumentSession` purely to pass our own guard. Is there a supported way for a
-policy to ask whether a chain will get a commit frame?
+So the policy checks for a `[WriteAggregate]` parameter itself (`IdempotencyPolicy.WritesAggregate`), duplicating
+the one fragment of the detection the flag misses. An earlier revision made every such handler carry an unused
+`IDocumentSession` instead. Is there a supported way for a policy to ask whether a chain will get a commit frame?
 
 **3. Is frame placement by variable dependency a contract?**
 We shipped a workaround that re-hoisted the `CommittedAggregate<T>` projection frame to the head of
@@ -121,8 +121,7 @@ session has queued but not yet committed, via `session.Events.ProjectLatest<T>()
 
 ```csharp
 [WolverinePost("/orders/{orderId}/approve")]
-public static (CommittedAggregate<Order>, OrderApproved) Approve([WriteAggregate] Order order,
-    IDocumentSession session) =>
+public static (CommittedAggregate<Order>, OrderApproved) Approve([WriteAggregate] Order order) =>
     (new CommittedAggregate<Order>(), new OrderApproved());
 ```
 
