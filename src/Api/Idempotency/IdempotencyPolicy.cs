@@ -21,7 +21,9 @@ namespace Idempotency;
 /// completes, chain by chain, before any <see cref="IHttpPolicy" /> runs. It never sees
 /// <see cref="IdempotencyMiddleware" />'s own <see cref="Marten.IDocumentSession" /> parameter, so a handler that
 /// doesn't itself trigger the detection gets no save frame at all: the completion record inserts into a session
-/// nothing ever flushes.
+/// nothing ever flushes. A chain whose only Marten shape is <c>[WriteAggregate]</c> does get a commit frame while
+/// <c>chain.IsTransactional</c> stays false — a confirmed Wolverine bug, tracked as README open question 2 until
+/// it is filed.
 ///
 /// Nothing here can assert the registration order <see cref="IdempotencyMiddleware" /> needs, because a policy runs
 /// before the frames it competes with exist. That check lives at runtime instead.
@@ -70,8 +72,6 @@ public sealed class IdempotencyPolicy : IHttpPolicy
 
             if (middlewareType.IsGenericType)
                 BindResponse(chain, middlewareType);
-
-            CommittedAggregate.HoistProjection(chain);
         }
     }
 

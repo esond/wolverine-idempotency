@@ -119,6 +119,7 @@ public class IdempotencyEndpointTests(TestHost fixture) : IntegrationTestBase(fi
         {
             await Assert.That(answered.Status).IsEqualTo(OrderStatus.Approved);
             await Assert.That(answered.Status).IsEqualTo(stored.Status);
+            await Assert.That(answered.Version).IsEqualTo(stored.Version);
             await Assert.That(answered.LastModified).IsEqualTo(stored.LastModified);
         }
     }

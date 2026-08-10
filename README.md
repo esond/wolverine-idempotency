@@ -48,11 +48,13 @@ await documentSession.SaveChangesAsync(httpContext.RequestAborted);   // <- the 
 So `Approve` carries an unused `IDocumentSession` purely to pass our own guard. Is there a supported way for a
 policy to ask whether a chain will get a commit frame?
 
-**3. Is `UseForResponse` + `MiddlewarePolicy` frame ordering meant to be managed by hand?**
-Both append to `chain.Postprocessors` rather than positioning within it, so the `CommittedAggregate<T>` projection
-frame lands behind the commit on the first pass, and behind the `After` middleware that reads its result on the
-second. We re-hoist it to index 0 after every appending pass (`CommittedAggregate.HoistProjection`). Is there a
-supported way to position a frame relative to the commit frame?
+**3. Is frame placement by variable dependency a contract?**
+We shipped a workaround that re-hoisted the `CommittedAggregate<T>` projection frame to the head of
+`chain.Postprocessors`, reasoning that `UseForResponse` and Wolverine's middleware policy both append behind the
+commit. Community review showed it was dead code: JasperFx places frames by variable dependency, not list position,
+and the generated chain is byte-identical with the frame hoisted, left at the tail, or never moved. The order the
+guarantee needs — project, complete, then `SaveChangesAsync` — comes out right because the completion middleware
+consumes the projected response. Nothing documents that placement as a contract. Is it one?
 
 **4. Can the aggregate Wolverine re-fetches for an `UpdatedAggregate` response be observed?**
 We assume not, and wrote `CommittedAggregate<T>` instead. Is projecting pending, uncommitted events ahead of the
@@ -61,6 +63,9 @@ save a sound thing to be doing?
 **5. Reading the raw body from a chain frame.**
 `EnableBuffering` plus a rewind works, but the ordering it depends on comes from registration order, in reverse, and
 nothing checks it. Is there a supported way to say "this frame runs before body deserialization"?
+
+Community review confirmed 1 and 2 as Wolverine bugs — 1 doubling as the ask for an unwinding hook its workaround
+stands in for — and 5 as a feature request. None is filed yet; the workaround sites in the code point back here.
 
 ## How it works
 
@@ -118,9 +123,14 @@ public static (CommittedAggregate<Order>, OrderApproved) Approve([WriteAggregate
     (new CommittedAggregate<Order>(), new OrderApproved());
 ```
 
-Marten stamps an event's `Timestamp` and `UserName` as it saves, so a projection running ahead of the commit reads
-events carrying neither. `CommittedAggregate<T>` stamps the pending events with the values Marten would have
-written; Marten leaves already-set values alone, so the response and the committed document agree.
+Marten assigns an event's `Version`, `Timestamp` and `UserName` as it saves, so a projection running ahead of the
+commit reads events carrying none of them. `CommittedAggregate<T>` stamps the pending events with the values Marten
+is going to write — versions count up from the stream's expected server version, and Marten leaves already-set
+values alone — so the response and the committed document agree.
+
+That set is also the boundary. An event's global `Sequence` is drawn from a database sequence inside the save, so
+no pre-commit value can match it, and headers are parsed back out of JSON only after the save writes them. An
+aggregate deriving state from either is not supported behind `CommittedAggregate<T>`.
 
 ### Build-time guards
 
@@ -187,8 +197,11 @@ tenants sending the same key must not reach each other's stored response. Do not
 ## Known trade-offs
 
 - **A request that outlives its hold loses its key.** `ReservationTimeout` has to exceed the worst-case duration of
-  every endpoint that can reserve one. Set it too low and a slow but healthy request loses its reservation
-  mid-flight, and its own completion rolls the work back. The metric to watch is `takeover`.
+  every endpoint that can reserve one. Losing the hold costs nothing by itself: a completion whose key was never
+  taken over finds its own token still on the record, expired or not, and commits normally. The rollback fires only
+  when a later request actually took the key — at which point a duplicate dispatch is live, and letting both
+  transactions commit is the double execution the mechanism exists to prevent. Nothing durable is lost either way;
+  the transaction that rolls back never committed. The metric to watch is `takeover`.
 - **Work that rolls back leaves its key held** until the reservation expires. It self-heals on the same timer a
   process crash does.
 - **A handler that calls `SaveChangesAsync` itself gets a weaker guarantee.** The build-time check proves the

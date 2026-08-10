@@ -28,6 +28,16 @@ public record Order
     public OrderStatus Status { get; init; }
 
     /// <summary>
+    /// The stream version this document was projected from, assigned by Marten's version-member convention.
+    /// </summary>
+    /// <remarks>
+    /// Marten assigns an event's version as it saves, so a queued event carries version 0 and a projection running
+    /// ahead of the commit would answer 0 while the committed document counts the stream.
+    /// <see cref="CommittedAggregate{T}" /> stamps the pending events so both agree.
+    /// </remarks>
+    public long Version { get; init; }
+
+    /// <summary>
     /// The timestamp of the last event folded into this aggregate.
     /// </summary>
     /// <remarks>

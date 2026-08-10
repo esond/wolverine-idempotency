@@ -78,8 +78,8 @@ public abstract class IdempotencyMiddleware(IdempotencyStore store, ILogger<Idem
         //
         // This is the only release: a Wolverine `Finally` cannot be paired with a Before that returns IResult,
         // because the frame wrapping the two never resolves the continuation's HttpContext and code generation
-        // fails. A request that reaches the host without ever starting a response therefore keeps its key, which
-        // then expires on its own.
+        // fails — a confirmed Wolverine bug, tracked as README open question 1 until it is filed. A request that
+        // reaches the host without ever starting a response therefore keeps its key, which then expires on its own.
         httpContext.Response.OnStarting(ReleaseBeforeResponding);
 
         return WolverineContinue.Result();
