@@ -497,3 +497,6 @@ $RECYCLE.BIN/
 
 # Wolverine code generation output
 Internal/
+
+# Local package-feed configuration for validating candidate Wolverine builds stays local
+nuget.config
