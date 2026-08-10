@@ -65,7 +65,10 @@ save a sound thing to be doing?
 nothing checks it. Is there a supported way to say "this frame runs before body deserialization"?
 
 Community review confirmed 1 and 2 as Wolverine bugs — 1 doubling as the ask for an unwinding hook its workaround
-stands in for — and 5 as a feature request. None is filed yet; the workaround sites in the code point back here.
+stands in for — and 5 as a feature request. 1 is filed as
+[JasperFx/wolverine#3892](https://github.com/JasperFx/wolverine/issues/3892) and 2 as
+[JasperFx/wolverine#3893](https://github.com/JasperFx/wolverine/issues/3893); 5 is not filed yet. The
+workaround sites in the code point back here.
 
 ## How it works
 

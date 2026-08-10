@@ -22,8 +22,7 @@ namespace Idempotency;
 /// <see cref="IdempotencyMiddleware" />'s own <see cref="Marten.IDocumentSession" /> parameter, so a handler that
 /// doesn't itself trigger the detection gets no save frame at all: the completion record inserts into a session
 /// nothing ever flushes. A chain whose only Marten shape is <c>[WriteAggregate]</c> does get a commit frame while
-/// <c>chain.IsTransactional</c> stays false — a confirmed Wolverine bug, tracked as README open question 2 until
-/// it is filed.
+/// <c>chain.IsTransactional</c> stays false — a confirmed Wolverine bug, filed as JasperFx/wolverine#3893.
 ///
 /// Nothing here can assert the registration order <see cref="IdempotencyMiddleware" /> needs, because a policy runs
 /// before the frames it competes with exist. That check lives at runtime instead.
