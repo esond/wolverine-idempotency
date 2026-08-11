@@ -22,9 +22,9 @@ written through the caller's own `IDocumentSession`, so there is one commit. Onl
 
 ## Open questions
 
-**1. Is `Response.OnStarting` the right place to release a key?**
-A Wolverine `Finally` cannot be paired with a `Before` that returns `IResult`. Add
-`public Task Finally(HttpContext httpContext)` to `IdempotencyMiddleware` and code generation dies:
+**1. ~~Is `Response.OnStarting` the right place to release a key?~~ Answered — the unwinding hook exists now.**
+A Wolverine `Finally` could not be paired with a `Before` that returns `IResult`. Adding `public Task Finally()` to
+`IdempotencyMiddleware` killed code generation:
 
 ```
 System.NullReferenceException: Object reference not set to an instance of an object.
@@ -32,7 +32,14 @@ System.NullReferenceException: Object reference not set to an instance of an obj
       in src/Http/Wolverine.Http/CodeGen/ResultContinuationPolicy.cs:69
 ```
 
-Is the pairing meant to work, and is there a supported unwinding hook for a short-circuiting `Before`?
+[JasperFx/wolverine#3895](https://github.com/JasperFx/wolverine/pull/3895) fixed it, in 6.25.5. Every idempotent
+chain now wraps everything after `Before` in a `try`/`finally`, and the short-circuit `return` unwinds through it.
+
+`OnStarting` stays the release, because the `finally` runs *after* the response is written — a client already
+holding the refusal can beat it to the retry, which is
+`A_request_that_fails_validation_frees_its_key_for_a_corrected_retry` failing. `Finally` is the backstop for the one
+case `OnStarting` cannot see: a request the host never answered, whose key used to stay held until its reservation
+expired.
 
 **2. Should `[WriteAggregate]` make a chain `IsTransactional`?**
 `chain.IsTransactional` is false for a chain whose only Marten shape is `[WriteAggregate]`, and that chain does get
@@ -65,9 +72,9 @@ save a sound thing to be doing?
 nothing checks it. Is there a supported way to say "this frame runs before body deserialization"?
 
 Community review confirmed 1 and 2 as Wolverine bugs — 1 doubling as the ask for an unwinding hook its workaround
-stands in for — and 5 as a feature request. 1 is filed as
-[JasperFx/wolverine#3892](https://github.com/JasperFx/wolverine/issues/3892) and 2 as
-[JasperFx/wolverine#3893](https://github.com/JasperFx/wolverine/issues/3893); 5 is not filed yet. The
+stood in for — and 5 as a feature request. 1 was filed as
+[JasperFx/wolverine#3892](https://github.com/JasperFx/wolverine/issues/3892) and is fixed as of 6.25.5; 2 is filed as
+[JasperFx/wolverine#3893](https://github.com/JasperFx/wolverine/issues/3893) and open; 5 is not filed yet. The
 workaround sites in the code point back here.
 
 ## How it works
@@ -85,7 +92,11 @@ IdempotencyMiddleware.Before      Hashes the raw request body, reserves the key,
 IdempotencyMiddleware.After       Queues the completion record on the caller's IDocumentSession. Does not
                                   save — the chain's own commit frame carries both.
 
-Response.OnStarting               Releases the key for any request that did not complete.
+Response.OnStarting               Releases the key for any request that did not complete, ahead of the
+                                  response the caller would retry on.
+
+IdempotencyMiddleware.Finally     Backstop for a request the host never answered, which OnStarting cannot
+                                  see. Runs from the chain's own `finally`.
 ```
 
 | File | What it is |
@@ -209,7 +220,6 @@ tenants sending the same key must not reach each other's stored response. Do not
 - **A handler that calls `SaveChangesAsync` itself gets a weaker guarantee.** The build-time check proves the
   framework will append a commit frame; it cannot see that the handler already committed. Those endpoints get the
   work in one transaction and the record in another, and no check will say so.
-- **A request that never starts a response leaves its key held.** The release runs as the response starts.
 - **A multipart body is not fingerprinted.** Its boundary is randomly generated, so the same logical upload sent
   twice is different bytes. The key alone identifies those requests.
 - **A replayed `Content-Type` is equivalent, not identical.** It drops the `charset` parameter, because the

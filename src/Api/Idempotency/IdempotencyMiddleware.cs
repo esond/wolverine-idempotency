@@ -34,6 +34,8 @@ public abstract class IdempotencyMiddleware(IdempotencyStore store, ILogger<Idem
 
     private bool _completed;
 
+    private bool _released;
+
     public async Task<IResult> Before(HttpContext httpContext)
     {
         var suppliedKey = httpContext.Request.Headers[IdempotencyHeaderNames.IdempotencyKey].ToString();
@@ -72,15 +74,12 @@ public abstract class IdempotencyMiddleware(IdempotencyStore store, ILogger<Idem
         _reservation = reserved.Record;
 
         // Freeing the key as the response starts, rather than only once the chain unwinds, is what lets a caller fix
-        // a rejected request and retry it on the same key. Released afterwards, the retry races the release and is
-        // told the key is still in flight, or — once the corrected body changes the fingerprint — that the key
-        // belongs to a different request, which no amount of retrying resolves.
-        //
-        // This is the only release: a Wolverine `Finally` cannot be paired with a Before that returns IResult,
-        // because the frame wrapping the two never resolves the continuation's HttpContext and code generation
-        // fails — a confirmed Wolverine bug, filed as JasperFx/wolverine#3892. A request that
-        // reaches the host without ever starting a response therefore keeps its key, which then expires on its own.
-        httpContext.Response.OnStarting(ReleaseBeforeResponding);
+        // a rejected request and retry it on the same key. The unwind runs after the response has been written, so a
+        // client that already holds the refusal can beat the release to the retry and be told the key is still in
+        // flight — or, once the corrected body changes the fingerprint, that the key belongs to a different request,
+        // which no amount of retrying resolves. Removing this and leaving Finally to carry the release on its own
+        // fails A_request_that_fails_validation_frees_its_key_for_a_corrected_retry.
+        httpContext.Response.OnStarting(Release);
 
         return WolverineContinue.Result();
     }
@@ -115,12 +114,29 @@ public abstract class IdempotencyMiddleware(IdempotencyStore store, ILogger<Idem
         _completed = true;
     }
 
+    /// <summary>
+    /// Frees the key of a request that left the chain without the release above ever running.
+    /// </summary>
+    /// <remarks>
+    /// The generated chain calls this from a <c>finally</c> wrapping everything after <see cref="Before" />, which is
+    /// the one place that sees a request the host never answered — a client that disconnected mid-flight, a
+    /// cancellation that unwound the chain before anything was written. <c>OnStarting</c> alone leaves that request's
+    /// key held until its reservation expires. This is a backstop, not the release: for every request that does
+    /// answer, <c>OnStarting</c> has already run and this finds nothing to do.
+    ///
+    /// Wolverine could not generate this pairing at all before 6.25.5. A <c>Finally</c> alongside a <c>Before</c>
+    /// returning <see cref="IResult" /> failed code generation with a <see cref="NullReferenceException" /> in
+    /// <c>MaybeEndWithResultFrame</c>, which is what left <c>OnStarting</c> carrying the release by itself —
+    /// JasperFx/wolverine#3892, fixed by JasperFx/wolverine#3895.
+    /// </remarks>
+    public Task Finally() => Release();
+
     // Throwing out of an OnStarting callback aborts a response the pipeline had already decided, so a database fault
     // here would turn a plain validation refusal into a failed request. A key this leaves held still expires on its
-    // own.
-    private async Task ReleaseBeforeResponding()
+    // own — and leaving _released unset gives the Finally backstop one more attempt at it.
+    private async Task Release()
     {
-        if (_completed || _reservation is not { } reservation)
+        if (_completed || _released || _reservation is not { } reservation)
             return;
 
         try
@@ -128,10 +144,12 @@ public abstract class IdempotencyMiddleware(IdempotencyStore store, ILogger<Idem
             // Not the request's own cancellation token: an abandoned request is exactly the one whose key must come
             // back, and a canceled release would hold it until the reservation times out instead.
             await store.Release(reservation, CancellationToken.None);
+
+            _released = true;
         }
         catch (Exception exception)
         {
-            logger.CouldNotReleaseBeforeResponding(exception, reservation.Id);
+            logger.CouldNotRelease(exception, reservation.Id);
         }
     }
 
@@ -222,8 +240,7 @@ public sealed class IdempotencyStatusMiddleware(IdempotencyStore store, ILogger<
 
 internal static partial class IdempotencyMiddlewareLogging
 {
-    [LoggerMessage(Level = LogLevel.Warning, Message = "Could not release idempotency key {IdempotencyKey} before " +
-        "responding. It stays held until its reservation expires.")]
-    public static partial void CouldNotReleaseBeforeResponding(this ILogger logger, Exception exception,
-        string idempotencyKey);
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Could not release idempotency key {IdempotencyKey}. It stays " +
+        "held until its reservation expires.")]
+    public static partial void CouldNotRelease(this ILogger logger, Exception exception, string idempotencyKey);
 }
