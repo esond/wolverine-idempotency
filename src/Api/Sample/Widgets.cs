@@ -21,6 +21,8 @@ public record Widget
 
 public record CreateWidget(string Name, int Size);
 
+public record RenameWidget(string Name);
+
 public record WidgetPreview(string Name, int Size);
 
 public record WidgetToken(string Value);
@@ -83,6 +85,33 @@ public static class WidgetEndpoints
         session.Store(widget with { TokenHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(token))) });
 
         return TypedResults.Created($"/widgets/{id}/tokens", new WidgetToken(token));
+    }
+
+    /// <summary>
+    /// Renames a widget, answering with a bare <see cref="IResult" /> instead of a typed union.
+    /// </summary>
+    /// <remarks>
+    /// The bare return type is the whole point of this endpoint: it is what makes the chain fail code generation
+    /// with <c>CS0136</c>.
+    ///
+    /// Wolverine names a generated local after the type that produced it, so an endpoint returning
+    /// <c>Results&lt;NoContent, NotFound&gt;</c> gets <c>resultsOfNoContentAndNotFound</c> and never collides with
+    /// the <c>result</c> that <see cref="IdempotencyMiddleware.Before" /> returns. A bare
+    /// <see cref="IResult" /> gets <c>result</c> too. Without a <c>Finally</c> the arranger sees both in one scope
+    /// and renames the earlier one to <c>result1</c>; the <c>try</c> that <c>Finally</c> introduces puts them in
+    /// nested scopes, where that rename no longer applies but C# still forbids the shadowing.
+    /// </remarks>
+    [WolverinePost("/widgets/{id}/name")]
+    public static async Task<IResult> Rename(Guid id, RenameWidget command, IDocumentSession session)
+    {
+        if (await session.LoadAsync<Widget>(id) is not { } widget)
+            return TypedResults.NotFound();
+
+        var renamed = widget with { Name = command.Name };
+
+        session.Store(renamed);
+
+        return TypedResults.Ok(renamed);
     }
 
     /// <summary>
