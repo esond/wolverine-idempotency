@@ -41,19 +41,16 @@ holding the refusal can beat it to the retry, which is
 case `OnStarting` cannot see: a request the host never answered, whose key used to stay held until its reservation
 expired.
 
-**2. Should `[WriteAggregate]` make a chain `IsTransactional`?**
-`chain.IsTransactional` is false for a chain whose only Marten shape is `[WriteAggregate]`, and that chain does get
-a commit frame. Comment out the policy, and `dotnet run --project src/Api -- codegen write` emits, for `Approve`:
+**2. ~~Should `[WriteAggregate]` make a chain `IsTransactional`?~~ Answered — the flag is trustworthy now.**
+`chain.IsTransactional` was false for a chain whose only Marten shape is `[WriteAggregate]`, while that chain did
+get a commit frame. The policy carried a second check for that shape (`IdempotencyPolicy.WritesAggregate`),
+duplicating the one fragment of the detection the flag missed; an earlier revision made every such handler carry an
+unused `IDocumentSession` instead.
 
-```csharp
-(var committedAggregateOfOrder, var orderApproved) = OrderEndpoints.Approve(stream_order.Aggregate);
-var order_response = await CommittedAggregate<Order>.Project(stream_order, documentSession, ...);
-await documentSession.SaveChangesAsync(httpContext.RequestAborted);   // <- the frame IsTransactional says isn't there
-```
-
-So the policy checks for a `[WriteAggregate]` parameter itself (`IdempotencyPolicy.WritesAggregate`), duplicating
-the one fragment of the detection the flag misses. An earlier revision made every such handler carry an unused
-`IDocumentSession` instead. Is there a supported way for a policy to ask whether a chain will get a commit frame?
+[JasperFx/wolverine#3893](https://github.com/JasperFx/wolverine/issues/3893) was fixed by
+[#3901](https://github.com/JasperFx/wolverine/pull/3901), in 6.26.0, and 6.27.0
+([#3911](https://github.com/JasperFx/wolverine/pull/3911)) closed the same disagreement for a chain made
+transactional by an `IMartenOp` return. `IdempotencyPolicy` asks `chain.IsTransactional` and nothing else.
 
 **3. Is frame placement by variable dependency a contract?**
 We shipped a workaround that re-hoisted the `CommittedAggregate<T>` projection frame to the head of
