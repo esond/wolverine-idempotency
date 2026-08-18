@@ -68,11 +68,30 @@ save a sound thing to be doing?
 `EnableBuffering` plus a rewind works, but the ordering it depends on comes from registration order, in reverse, and
 nothing checks it. Is there a supported way to say "this frame runs before body deserialization"?
 
+**6. A `Finally` alongside an endpoint returning a bare `IResult` generates a chain that will not compile.**
+Wolverine names a generated local after the type that produced it, so an endpoint returning
+`Results<NoContent, NotFound>` gets `resultsOfNoContentAndNotFound` and never meets the `result` that
+`IdempotencyMiddleware.Before` returns. A bare `IResult` gets `result` too. Without a `Finally` the arranger sees
+both in one scope and renames the earlier one; the `try` that `Finally` introduces puts them in nested scopes,
+where that rename no longer applies but C# still forbids the shadowing:
+
+```csharp
+var result = await idempotencyResponseMiddlewareOfResult.Before(httpContext);   // outer scope
+try
+{
+    var result = await WidgetEndpoints.Rename(id, command, documentSession);    // CS0136, and CS0841 above it
+```
+
+So question 1's fix reintroduced the same shape's problem one layer down. `POST /widgets/{id}/name` is the
+reproduction. Nothing fails at startup — code generation is per chain and lazy, so the host boots and only a
+request that reaches that endpoint discovers its chain never compiled, as a 500. Under `codegen write` it fails
+the build. Reproduced on 6.29.0 and not filed upstream.
+
 Community review confirmed 1 and 2 as Wolverine bugs — 1 doubling as the ask for an unwinding hook its workaround
 stood in for — and 5 as a feature request. 1 was filed as
-[JasperFx/wolverine#3892](https://github.com/JasperFx/wolverine/issues/3892) and is fixed as of 6.25.5; 2 is filed as
-[JasperFx/wolverine#3893](https://github.com/JasperFx/wolverine/issues/3893) and open; 5 is not filed yet. The
-workaround sites in the code point back here.
+[JasperFx/wolverine#3892](https://github.com/JasperFx/wolverine/issues/3892) and fixed in 6.25.5; 2 as
+[JasperFx/wolverine#3893](https://github.com/JasperFx/wolverine/issues/3893) and fixed in 6.26.0. 5 and 6 are not
+filed. The workaround sites in the code point back here.
 
 ## How it works
 
@@ -166,7 +185,7 @@ that starts a stream it is the better answer. It does not generalize:
 
 ```sh
 docker compose up -d          # Postgres on 5433
-dotnet test                   # 50 tests
+dotnet test                   # 51 tests
 dotnet run --project src/Api  # the sample API on http://localhost:5000
 ```
 
@@ -200,6 +219,7 @@ Location: /widgets/019fd5c3-…                   Location: /widgets/019fd5c3-�
 | `POST /widgets/{id}/archive` | A `204`: why completion is a timestamp and not "the body is null" |
 | `POST /widgets/{id}/tokens` | `[IdempotencyOmitsResponseBody]` — a one-time secret replays status and `Location` alone |
 | `POST /widgets/preview` | `[IdempotencyOptOut]` — no transaction, so no guarantee |
+| `POST /widgets/{id}/name` | Open question 6. A bare `IResult` return, so its chain does not compile — it answers 500 |
 
 `TenantAuthenticationHandler` stands in for real authentication, because the key is scoped to the caller. Two
 tenants sending the same key must not reach each other's stored response. Do not copy it.

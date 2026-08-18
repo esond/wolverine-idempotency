@@ -92,7 +92,7 @@ public static class WidgetEndpoints
     /// </summary>
     /// <remarks>
     /// The bare return type is the whole point of this endpoint: it is what makes the chain fail code generation
-    /// with <c>CS0136</c>.
+    /// with <c>CS0136</c> — README open question 6.
     ///
     /// Wolverine names a generated local after the type that produced it, so an endpoint returning
     /// <c>Results&lt;NoContent, NotFound&gt;</c> gets <c>resultsOfNoContentAndNotFound</c> and never collides with

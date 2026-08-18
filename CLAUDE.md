@@ -6,7 +6,7 @@ Read `README.md` first. It is the design document, and it stays current with the
 
 ## The open questions are the point
 
-The five "Open questions" in the README are places where the code works around a missing framework hook, and each
+The "Open questions" in the README are places where the code works around a missing framework hook, and each
 workaround is reproduced deliberately so a Critter Stack maintainer can see it. They are not a TODO list. Do not
 "clean up" or "fix" them unless asked to.
 
