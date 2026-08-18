@@ -213,7 +213,10 @@ tenants sending the same key must not reach each other's stored response. Do not
   transactions commit is the double execution the mechanism exists to prevent. Nothing durable is lost either way;
   the transaction that rolls back never committed. The metric to watch is `takeover`.
 - **Work that rolls back leaves its key held** until the reservation expires. It self-heals on the same timer a
-  process crash does.
+  process crash does. Wolverine 6.29.0's `AfterCommit` hook looks like the fix — treat a completion as real only
+  once the commit lands — and is not. On an HTTP chain its frame is emitted *after* the response-writing
+  postprocessor, so it runs after `OnStarting` has already decided, and a failure between the commit and the
+  response write would skip it and let the unwind release a key whose work did commit.
 - **A handler that calls `SaveChangesAsync` itself gets a weaker guarantee.** The build-time check proves the
   framework will append a commit frame; it cannot see that the handler already committed. Those endpoints get the
   work in one transaction and the record in another, and no check will say so.
