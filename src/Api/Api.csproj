@@ -6,11 +6,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Marten" Version="9.22.6" />
-    <PackageReference Include="WolverineFx.Http" Version="6.25.5" />
-    <PackageReference Include="WolverineFx.Http.Marten" Version="6.25.5" />
-    <PackageReference Include="WolverineFx.Marten" Version="6.25.5" />
-    <PackageReference Include="WolverineFx.RuntimeCompilation" Version="6.25.5" />
+    <PackageReference Include="Marten" Version="9.28.0" />
+    <PackageReference Include="WolverineFx.Http" Version="6.29.0" />
+    <PackageReference Include="WolverineFx.Http.Marten" Version="6.29.0" />
+    <PackageReference Include="WolverineFx.Marten" Version="6.29.0" />
+    <PackageReference Include="WolverineFx.RuntimeCompilation" Version="6.29.0" />
   </ItemGroup>
 
 </Project>
