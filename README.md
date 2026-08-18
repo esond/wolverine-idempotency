@@ -41,19 +41,16 @@ holding the refusal can beat it to the retry, which is
 case `OnStarting` cannot see: a request the host never answered, whose key used to stay held until its reservation
 expired.
 
-**2. Should `[WriteAggregate]` make a chain `IsTransactional`?**
-`chain.IsTransactional` is false for a chain whose only Marten shape is `[WriteAggregate]`, and that chain does get
-a commit frame. Comment out the policy, and `dotnet run --project src/Api -- codegen write` emits, for `Approve`:
+**2. ~~Should `[WriteAggregate]` make a chain `IsTransactional`?~~ Answered — the flag is trustworthy now.**
+`chain.IsTransactional` was false for a chain whose only Marten shape is `[WriteAggregate]`, while that chain did
+get a commit frame. The policy carried a second check for that shape (`IdempotencyPolicy.WritesAggregate`),
+duplicating the one fragment of the detection the flag missed; an earlier revision made every such handler carry an
+unused `IDocumentSession` instead.
 
-```csharp
-(var committedAggregateOfOrder, var orderApproved) = OrderEndpoints.Approve(stream_order.Aggregate);
-var order_response = await CommittedAggregate<Order>.Project(stream_order, documentSession, ...);
-await documentSession.SaveChangesAsync(httpContext.RequestAborted);   // <- the frame IsTransactional says isn't there
-```
-
-So the policy checks for a `[WriteAggregate]` parameter itself (`IdempotencyPolicy.WritesAggregate`), duplicating
-the one fragment of the detection the flag misses. An earlier revision made every such handler carry an unused
-`IDocumentSession` instead. Is there a supported way for a policy to ask whether a chain will get a commit frame?
+[JasperFx/wolverine#3893](https://github.com/JasperFx/wolverine/issues/3893) was fixed by
+[#3901](https://github.com/JasperFx/wolverine/pull/3901), in 6.26.0, and 6.27.0
+([#3911](https://github.com/JasperFx/wolverine/pull/3911)) closed the same disagreement for a chain made
+transactional by an `IMartenOp` return. `IdempotencyPolicy` asks `chain.IsTransactional` and nothing else.
 
 **3. Is frame placement by variable dependency a contract?**
 We shipped a workaround that re-hoisted the `CommittedAggregate<T>` projection frame to the head of
@@ -71,11 +68,30 @@ save a sound thing to be doing?
 `EnableBuffering` plus a rewind works, but the ordering it depends on comes from registration order, in reverse, and
 nothing checks it. Is there a supported way to say "this frame runs before body deserialization"?
 
+**6. A `Finally` alongside an endpoint returning a bare `IResult` generates a chain that will not compile.**
+Wolverine names a generated local after the type that produced it, so an endpoint returning
+`Results<NoContent, NotFound>` gets `resultsOfNoContentAndNotFound` and never meets the `result` that
+`IdempotencyMiddleware.Before` returns. A bare `IResult` gets `result` too. Without a `Finally` the arranger sees
+both in one scope and renames the earlier one; the `try` that `Finally` introduces puts them in nested scopes,
+where that rename no longer applies but C# still forbids the shadowing:
+
+```csharp
+var result = await idempotencyResponseMiddlewareOfResult.Before(httpContext);   // outer scope
+try
+{
+    var result = await WidgetEndpoints.Rename(id, command, documentSession);    // CS0136, and CS0841 above it
+```
+
+So question 1's fix reintroduced the same shape's problem one layer down. `POST /widgets/{id}/name` is the
+reproduction. Nothing fails at startup — code generation is per chain and lazy, so the host boots and only a
+request that reaches that endpoint discovers its chain never compiled, as a 500. Under `codegen write` it fails
+the build. Reproduced on 6.29.0 and not filed upstream.
+
 Community review confirmed 1 and 2 as Wolverine bugs — 1 doubling as the ask for an unwinding hook its workaround
 stood in for — and 5 as a feature request. 1 was filed as
-[JasperFx/wolverine#3892](https://github.com/JasperFx/wolverine/issues/3892) and is fixed as of 6.25.5; 2 is filed as
-[JasperFx/wolverine#3893](https://github.com/JasperFx/wolverine/issues/3893) and open; 5 is not filed yet. The
-workaround sites in the code point back here.
+[JasperFx/wolverine#3892](https://github.com/JasperFx/wolverine/issues/3892) and fixed in 6.25.5; 2 as
+[JasperFx/wolverine#3893](https://github.com/JasperFx/wolverine/issues/3893) and fixed in 6.26.0. 5 and 6 are not
+filed. The workaround sites in the code point back here.
 
 ## How it works
 
@@ -169,7 +185,7 @@ that starts a stream it is the better answer. It does not generalize:
 
 ```sh
 docker compose up -d          # Postgres on 5433
-dotnet test                   # 50 tests
+dotnet test                   # 51 tests
 dotnet run --project src/Api  # the sample API on http://localhost:5000
 ```
 
@@ -203,6 +219,7 @@ Location: /widgets/019fd5c3-…                   Location: /widgets/019fd5c3-�
 | `POST /widgets/{id}/archive` | A `204`: why completion is a timestamp and not "the body is null" |
 | `POST /widgets/{id}/tokens` | `[IdempotencyOmitsResponseBody]` — a one-time secret replays status and `Location` alone |
 | `POST /widgets/preview` | `[IdempotencyOptOut]` — no transaction, so no guarantee |
+| `POST /widgets/{id}/name` | Open question 6. A bare `IResult` return, so its chain does not compile — it answers 500 |
 
 `TenantAuthenticationHandler` stands in for real authentication, because the key is scoped to the caller. Two
 tenants sending the same key must not reach each other's stored response. Do not copy it.
@@ -216,7 +233,10 @@ tenants sending the same key must not reach each other's stored response. Do not
   transactions commit is the double execution the mechanism exists to prevent. Nothing durable is lost either way;
   the transaction that rolls back never committed. The metric to watch is `takeover`.
 - **Work that rolls back leaves its key held** until the reservation expires. It self-heals on the same timer a
-  process crash does.
+  process crash does. Wolverine 6.29.0's `AfterCommit` hook looks like the fix — treat a completion as real only
+  once the commit lands — and is not. On an HTTP chain its frame is emitted *after* the response-writing
+  postprocessor, so it runs after `OnStarting` has already decided, and a failure between the commit and the
+  response write would skip it and let the unwind release a key whose work did commit.
 - **A handler that calls `SaveChangesAsync` itself gets a weaker guarantee.** The build-time check proves the
   framework will append a commit frame; it cannot see that the handler already committed. Those endpoints get the
   work in one transaction and the record in another, and no check will say so.
